@@ -2121,6 +2121,23 @@ class TestStaticMemberReconnect:
         assert sgp._reconnect_relevant_change({"active_group": (None, "other")}) is False
         assert sgp._reconnect_relevant_change({"synced_to": ("other", "other2")}) is False
 
+    def test_stopped_leading_native_group_classification(self) -> None:
+        """Only a member losing all of its own children counts as released from its group."""
+        mass = _make_mock_mass()
+        sgp = _make_sync_group(mass)
+
+        assert sgp._stopped_leading_native_group("m", {"group_members": (["m", "c"], ["m"])})
+        assert sgp._stopped_leading_native_group("m", {"group_members": (["m", "c"], [])})
+        # still leading someone, or never led anyone, is not a release
+        assert not sgp._stopped_leading_native_group(
+            "m", {"group_members": (["m", "c", "d"], ["m", "d"])}
+        )
+        assert not sgp._stopped_leading_native_group("m", {"group_members": ([], ["m"])})
+        assert not sgp._stopped_leading_native_group("m", {"group_members": (["m"], ["m", "c"])})
+        # a first report has no previous value to compare against
+        assert not sgp._stopped_leading_native_group("m", {"group_members": (None, ["m"])})
+        assert not sgp._stopped_leading_native_group("m", {"available": (False, True)})
+
     @pytest.mark.asyncio
     async def test_reconnect_task_field_clears_when_runner_completes(
         self, static_reconnect_setup: Any
@@ -2174,6 +2191,33 @@ class TestStaticMemberReconnect:
         await task
 
         mass.players._handle_set_members.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_static_reconnect_resumes_when_member_stops_leading_native_group(
+        self, static_reconnect_setup: Any
+    ) -> None:
+        """A member skipped for leading its own native group rejoins once that group dissolves."""
+        mass, sgp, leader, display = static_reconnect_setup()
+        display.provider.domain = "sonos"
+        display.native_grouping_requires_own_stream = True
+        display.state.group_members = ["display", "child"]
+        sgp.on_group_member_updated(display, {"available": (False, True)})
+        task = sgp._reconnect_task
+        assert task is not None
+        await task
+        mass.players._handle_set_members.assert_not_awaited()
+
+        # the member's own group dissolves: it has no owner to release it, so the
+        # shrinking member list is the only signal that it can be recovered now
+        display.state.group_members = ["display"]
+        sgp.on_group_member_updated(display, {"group_members": (["display", "child"], ["display"])})
+        task = sgp._reconnect_task
+        assert task is not None
+        await task
+
+        mass.players._handle_set_members.assert_awaited_once_with(
+            leader, player_ids_to_add=["display"]
+        )
 
     @pytest.mark.asyncio
     async def test_static_member_reconnects_without_resuming_playback(

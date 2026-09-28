@@ -19,6 +19,7 @@ from music_assistant.constants import (
     ATTR_AVAILABLE,
     ATTR_CAN_GROUP_WITH,
     ATTR_ENABLED,
+    ATTR_GROUP_MEMBERS,
     CONF_DYNAMIC_GROUP_MEMBERS,
     CONF_GROUP_MEMBERS,
     CONF_POWER_CONTROL,
@@ -757,7 +758,6 @@ class SyncGroupPlayer(Player):
             or self.sync_leader is None
             or not member_player.state.available
             or not member_player.state.enabled
-            or not self._reconnect_relevant_change(changed_values)
         ):
             return
         # a rediscovered player is a new instance for the same device: read the registry's
@@ -767,10 +767,19 @@ class SyncGroupPlayer(Player):
         if (current_leader := self.mass.players.get_player(leader.player_id)) is not None:
             leader = current_leader
         if member_player.player_id == leader.player_id:
-            for member_id in self._attr_static_group_members:
-                if member_id != member_player.player_id:
-                    self._schedule_reconnect(member_id)
-        elif member_player.player_id in self._attr_static_group_members and (
+            if self._reconnect_relevant_change(changed_values):
+                for member_id in self._attr_static_group_members:
+                    if member_id != member_player.player_id:
+                        self._schedule_reconnect(member_id)
+            return
+        if member_player.player_id not in self._attr_static_group_members:
+            return
+        if not (
+            self._reconnect_relevant_change(changed_values)
+            or self._stopped_leading_native_group(member_player.player_id, changed_values)
+        ):
+            return
+        if (
             member_player.player_id not in self._translate_to_parent_ids(leader.state.group_members)
             or member_player.player_id in self._reconnect_pending_ids
         ):
@@ -1615,6 +1624,23 @@ class SyncGroupPlayer(Player):
         if previous is None or current is None:
             return False
         return bool(set(current) - set(previous))
+
+    def _stopped_leading_native_group(
+        self, member_id: str, changed_values: dict[str, tuple[Any, Any]]
+    ) -> bool:
+        """
+        Return whether a member update means the member no longer leads its own native group.
+
+        :param member_id: The static member the update is for.
+        :param changed_values: The changed fields of the member's state update.
+        """
+        previous, current = changed_values.get(ATTR_GROUP_MEMBERS, (None, None))
+        if previous is None or current is None:
+            return False
+        # a member skipped for leading others never had an owner of its own, so losing
+        # those children is the only release signal it gives
+        led_others = any(child_id != member_id for child_id in previous)
+        return led_others and all(child_id == member_id for child_id in current)
 
     def _schedule_reconnect(self, member_id: str) -> None:
         """Schedule an idempotent add for a static member that has reconnected."""

@@ -2070,31 +2070,40 @@ class TestStaticMemberReconnect:
         assert sgp._reconnect_task is None
 
     @pytest.mark.asyncio
-    async def test_unexpected_error_does_not_strand_other_pending_members(
+    async def test_defect_ends_the_episode_without_losing_other_pending_members(
         self, static_reconnect_three_member_setup: Any
     ) -> None:
-        """One member's unexpected error must not abort recovery of the others."""
-        mass, sgp, leader, _display, _lamp = static_reconnect_three_member_setup()
+        """A defect aborts the episode; the members still pending recover on the next event."""
+        mass, sgp, leader, display, lamp = static_reconnect_three_member_setup()
         attempted: list[str] = []
 
         async def _add(_leader: Any, player_ids_to_add: list[str]) -> None:
             attempted.append(player_ids_to_add[0])
-            if player_ids_to_add[0] == "display":
+            if len(attempted) == 1:
                 raise RuntimeError("defect")
 
         mass.players._handle_set_members = AsyncMock(side_effect=_add)
         sgp.on_group_member_updated(leader, {"can_group_with": (frozenset(), frozenset({"x"}))})
         task = sgp._reconnect_task
         assert task is not None
-
         with (
             patch("music_assistant.providers.sync_group.player.RECONNECT_RETRY_DELAY", 0),
-            # reported to the task, but only after the remaining members were handled
-            pytest.raises(ExceptionGroup),
+            pytest.raises(RuntimeError),
         ):
             await task
 
-        # both members were attempted despite one raising, and nothing is stranded
+        # the member that hit the defect is not retried; the other one is still pending
+        assert len(attempted) == 1
+        remaining = {"display", "lamp"} - {attempted[0]}
+        assert sgp._reconnect_pending_ids == remaining
+
+        # the next relevant update re-arms the runner, which recovers the pending member
+        other = display if remaining == {"display"} else lamp
+        sgp.on_group_member_updated(other, {"available": (False, True)})
+        task = sgp._reconnect_task
+        assert task is not None
+        with patch("music_assistant.providers.sync_group.player.RECONNECT_RETRY_DELAY", 0):
+            await task
         assert sorted(attempted) == ["display", "lamp"]
         assert not sgp._reconnect_pending_ids
         assert sgp._reconnect_task is None
@@ -2157,24 +2166,21 @@ class TestStaticMemberReconnect:
     async def test_reconnect_unexpected_error_is_not_retried(
         self, static_reconnect_setup: Any
     ) -> None:
-        """A programming error is reported once, not retried away as a transient failure."""
+        """A programming error surfaces once, not retried away as a transient failure."""
         mass, sgp, _leader, display = static_reconnect_setup()
         mass.players._handle_set_members = AsyncMock(side_effect=RuntimeError("defect"))
 
         sgp.on_group_member_updated(display, {"available": (False, True)})
         task = sgp._reconnect_task
         assert task is not None
-        # raised once the episode drained: it must not strand or hide the defect
-        with pytest.raises(ExceptionGroup):
+        # a defect is not a transient failure: it ends the episode and reaches the task
+        with pytest.raises(RuntimeError):
             await task
 
         # a defect must not consume the retry budget like a transient failure would
         assert mass.players._handle_set_members.await_count == 1
         assert not sgp._reconnect_pending_ids
-        # surfaced as an error naming the member, not swallowed by the retry budget
-        message, member_id, *_rest = sgp.logger.error.call_args.args
-        assert "Unexpected error reconnecting static member" in message
-        assert member_id == "display"
+        assert sgp._reconnect_task is None
 
     @pytest.mark.asyncio
     async def test_static_reconnect_skips_member_leading_native_group(
@@ -2403,37 +2409,6 @@ class TestStaticMemberReconnect:
         assert sgp.sync_leader is rediscovered
         rediscovered.state.group_members = ["leader", "display"]
         assert sgp.group_members == ["leader", "display"]
-
-    @pytest.mark.asyncio
-    async def test_reconnect_surfaces_defect_after_recovering_other_members(
-        self, static_reconnect_three_member_setup: Any
-    ) -> None:
-        """A defect is reported once the remaining members got their recovery."""
-        mass, sgp, leader, _display, _lamp = static_reconnect_three_member_setup()
-        attempted: list[str] = []
-
-        async def _add(_leader: Any, player_ids_to_add: list[str]) -> None:
-            attempted.append(player_ids_to_add[0])
-            if player_ids_to_add[0] == "display":
-                raise RuntimeError("defect")
-
-        mass.players._handle_set_members = AsyncMock(side_effect=_add)
-        sgp.on_group_member_updated(leader, {"can_group_with": (frozenset(), frozenset({"x"}))})
-        task = sgp._reconnect_task
-        assert task is not None
-
-        with (
-            patch("music_assistant.providers.sync_group.player.RECONNECT_RETRY_DELAY", 0),
-            pytest.raises(ExceptionGroup) as exc_info,
-        ):
-            await task
-
-        # every member was still attempted before the failure reached the task
-        assert sorted(attempted) == ["display", "lamp"]
-        assert not sgp._reconnect_pending_ids
-        # the group keeps no stale task, and the defect is named rather than swallowed
-        assert sgp._reconnect_task is None
-        assert [str(err) for err in exc_info.value.exceptions] == ["defect"]
 
 
 class TestGetConfigEntriesMemberPicker:

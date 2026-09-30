@@ -762,7 +762,8 @@ class SyncGroupPlayer(Player):
             return
         # a rediscovered player is a new instance for the same device: read the registry's
         # instance for its member list, but leave self.sync_leader untouched — writing it
-        # here would trip _form_syncgroup's identity-based stale-form guards mid-form
+        # here would trip _form_syncgroup's identity-based stale-form guards mid-form;
+        # the reconnect runner adopts it under the group lock instead
         leader = self.sync_leader
         if (current_leader := self.mass.players.get_player(leader.player_id)) is not None:
             leader = current_leader
@@ -1734,6 +1735,12 @@ class SyncGroupPlayer(Player):
                 return False
             leader = self.mass.players.get_player(leader_id)
             member = self.mass.players.get_player(member_id)
+            if leader is not None and leader is not self.sync_leader:
+                # a rediscovered leader is a new instance for the same device: adopt it
+                # here, under the group lock, where no form can be in flight to trip
+                # over the change, and mirror its state instead of the retired one's
+                self.sync_leader = leader
+                self._update_attributes()
             if leader is None or not leader.state.available or not leader.state.enabled:
                 self._record_reconnect_attempt(member_id, attempts)
                 return True

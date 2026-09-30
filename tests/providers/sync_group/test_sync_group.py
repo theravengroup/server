@@ -2377,8 +2377,8 @@ class TestStaticMemberReconnect:
     async def test_reconnect_survives_leader_replaced_by_new_instance(
         self, static_reconnect_setup: Any
     ) -> None:
-        """A leader rediscovered as a new object must still re-arm its members."""
-        mass, sgp, _leader, display = static_reconnect_setup()
+        """A leader rediscovered as a new object re-arms its members and replaces the old one."""
+        mass, sgp, leader, display = static_reconnect_setup()
         mass.players._handle_set_members = AsyncMock()
         # provider rediscovery builds a fresh instance for the same physical player;
         # the group still holds the old one with the same player_id
@@ -2390,6 +2390,8 @@ class TestStaticMemberReconnect:
         sgp.on_group_member_updated(
             rediscovered, {"can_group_with": (frozenset(), frozenset({"display"}))}
         )
+        # the update alone must not swap the reference: a form may be in flight
+        assert sgp.sync_leader is leader
         task = sgp._reconnect_task
         assert task is not None
         await task
@@ -2397,6 +2399,10 @@ class TestStaticMemberReconnect:
         mass.players._handle_set_members.assert_awaited_once_with(
             rediscovered, player_ids_to_add=["display"]
         )
+        # the retired instance would keep reporting its last known state forever
+        assert sgp.sync_leader is rediscovered
+        rediscovered.state.group_members = ["leader", "display"]
+        assert sgp.group_members == ["leader", "display"]
 
     @pytest.mark.asyncio
     async def test_reconnect_surfaces_defect_after_recovering_other_members(

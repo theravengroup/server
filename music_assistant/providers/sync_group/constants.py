@@ -40,6 +40,9 @@ REFORM_DEBOUNCE_SECONDS: Final[float] = 2.0
 # a task alive, while a short device/leader outage can recover without user action.
 RECONNECT_RETRY_DELAY: Final[float] = 1.0
 RECONNECT_MAX_ATTEMPTS: Final[int] = 3
+# how long a reconnect keeps hold of the member after the join command, waiting for the
+# member to report its new leader, so another group configured with it sees the owner
+RECONNECT_JOIN_TIMEOUT: Final[float] = 5.0
 
 # Other exceptions must propagate rather than trigger reconnect retries.
 RECONNECT_RETRYABLE_ERRORS: Final[tuple[type[Exception], ...]] = (

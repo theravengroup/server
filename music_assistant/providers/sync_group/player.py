@@ -35,6 +35,7 @@ from .constants import (
     IDLE_GRACE_SECONDS,
     PLAYBACK_START_TIMEOUT,
     PROVIDERS_WITH_DYNAMIC_LEADER_SWITCH,
+    RECONNECT_JOIN_TIMEOUT,
     RECONNECT_MAX_ATTEMPTS,
     RECONNECT_RETRY_DELAY,
     RECONNECT_RETRYABLE_ERRORS,
@@ -1729,35 +1730,47 @@ class SyncGroupPlayer(Player):
             if leader is None or not leader.state.available or not leader.state.enabled:
                 self._record_reconnect_attempt(member_id, attempts)
                 return True
-            if not self._reconnect_member_eligible(member_id, leader, member):
-                self._reconnect_pending_ids.discard(member_id)
-                return True
-            self._reconnect_pending_ids.discard(member_id)
-            try:
-                for linked in leader.linked_output_protocols:
-                    if protocol_player := self.mass.players.get_player(linked.output_protocol_id):
-                        protocol_player.refresh_state(signal_event=False)
-                leader.refresh_state(signal_event=False)
-                # A returning player can become available before its protocol reports
-                # compatibility. Keep the reconnect pending so the next bounded pass
-                # can use the refreshed capability instead of silently dropping it.
-                if member_id not in leader.state.can_group_with:
-                    self._record_reconnect_attempt(member_id, attempts)
+            # Another active group configured with this member may be reconnecting it
+            # too. Serialize on the member (taken from under the group lock, the order
+            # get_player_lock requires) and keep hold of it until the member reports
+            # its new leader, so the other group finds the owner rather than a race.
+            async with self.mass.players.get_player_lock(member_id, PlayerLockPurpose.PLAYBACK):
+                if not self._reconnect_member_eligible(member_id, leader, member):
+                    self._reconnect_pending_ids.discard(member_id)
                     return True
-                await self.mass.players._handle_set_members(leader, player_ids_to_add=[member_id])
-            except asyncio.CancelledError:
-                raise
-            except RECONNECT_RETRYABLE_ERRORS as err:
-                attempt = self._record_reconnect_attempt(member_id, attempts)
-                self.logger.warning(
-                    "Could not reconnect static member %s to syncgroup %s (attempt %s/%s): %s",
-                    member_id,
-                    self.display_name,
-                    attempt,
-                    RECONNECT_MAX_ATTEMPTS,
-                    err,
-                )
-            return True
+                self._reconnect_pending_ids.discard(member_id)
+                try:
+                    for linked in leader.linked_output_protocols:
+                        if protocol_player := self.mass.players.get_player(
+                            linked.output_protocol_id
+                        ):
+                            protocol_player.refresh_state(signal_event=False)
+                    leader.refresh_state(signal_event=False)
+                    # A returning player can become available before its protocol reports
+                    # compatibility. Keep the reconnect pending so the next bounded pass
+                    # can use the refreshed capability instead of silently dropping it.
+                    if member_id not in leader.state.can_group_with:
+                        self._record_reconnect_attempt(member_id, attempts)
+                        return True
+                    async with self.mass.players.wait_for_player_update(
+                        member_id, attribute_name="synced_to", timeout=RECONNECT_JOIN_TIMEOUT
+                    ):
+                        await self.mass.players._handle_set_members(
+                            leader, player_ids_to_add=[member_id]
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except RECONNECT_RETRYABLE_ERRORS as err:
+                    attempt = self._record_reconnect_attempt(member_id, attempts)
+                    self.logger.warning(
+                        "Could not reconnect static member %s to syncgroup %s (attempt %s/%s): %s",
+                        member_id,
+                        self.display_name,
+                        attempt,
+                        RECONNECT_MAX_ATTEMPTS,
+                        err,
+                    )
+                return True
 
     def _reconnect_member_eligible(
         self, member_id: str, leader: Player, member: Player | None

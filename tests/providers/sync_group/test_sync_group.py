@@ -2410,6 +2410,58 @@ class TestStaticMemberReconnect:
         rediscovered.state.group_members = ["leader", "display"]
         assert sgp.group_members == ["leader", "display"]
 
+    @pytest.mark.asyncio
+    async def test_two_groups_sharing_a_member_reconnect_it_once(
+        self, static_reconnect_setup: Any
+    ) -> None:
+        """Two active groups configured with the same member serialize on it: one join, no steal."""
+        mass, group_a, leader_a, display = static_reconnect_setup()
+        # a second active group with its own leader, configured with the same member
+        group_b = _make_sync_group(mass, "syncgroup_b")
+        group_b.config.get_value = MagicMock(  # type: ignore[method-assign]
+            side_effect=lambda key, default=None: False if key == "dynamic_members" else default
+        )
+        leader_b = _make_mock_player("leader_b", provider_domain="sendspin")
+        leader_b.state.group_members = ["leader_b"]
+        leader_b.state.can_group_with = {"display"}
+        group_b._attr_static_group_members = ["leader_b", "display"]
+        group_b._attr_group_members = ["leader_b", "display"]
+        group_b.sync_leader = leader_b
+        mass.players.get_player = _player_lookup(
+            {"leader": leader_a, "leader_b": leader_b, "display": display}
+        )
+        # real per-player locks: the fixture's no-op lock would let both runners interleave
+        locks: dict[str, asyncio.Lock] = {}
+
+        @asynccontextmanager
+        async def _player_lock(player_id: str, purpose: Any = None) -> AsyncIterator[None]:
+            async with locks.setdefault(f"{purpose}_{player_id}", asyncio.Lock()):
+                yield
+
+        mass.players.get_player_lock = _player_lock
+        joined: list[str] = []
+
+        async def _add(leader: Any, player_ids_to_add: list[str]) -> None:
+            assert player_ids_to_add == ["display"]
+            joined.append(leader.player_id)
+            # the provider round-trip: the other group's runner gets to run in here
+            await asyncio.sleep(0)
+            display.state.synced_to = leader.player_id
+
+        mass.players._handle_set_members = AsyncMock(side_effect=_add)
+
+        group_a.on_group_member_updated(display, {"available": (False, True)})
+        group_b.on_group_member_updated(display, {"available": (False, True)})
+        assert group_a._reconnect_task is not None
+        assert group_b._reconnect_task is not None
+        await asyncio.gather(group_a._reconnect_task, group_b._reconnect_task)
+
+        # whichever group got there first owns the member; the other one saw that and left it
+        assert len(joined) == 1
+        assert display.state.synced_to == joined[0]
+        assert not group_a._reconnect_pending_ids
+        assert not group_b._reconnect_pending_ids
+
 
 class TestGetConfigEntriesMemberPicker:
     """Test the member options offered in the group settings dropdown."""

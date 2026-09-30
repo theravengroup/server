@@ -1752,8 +1752,14 @@ class SyncGroupPlayer(Player):
                     if member_id not in leader.state.can_group_with:
                         self._record_reconnect_attempt(member_id, attempts)
                         return True
+                    # a join the member never confirms is a failed attempt, not a done one:
+                    # left as done, the member would be abandoned and its lock released
+                    # without another group being able to see an owner
                     async with self.mass.players.wait_for_player_update(
-                        member_id, attribute_name="synced_to", timeout=RECONNECT_JOIN_TIMEOUT
+                        member_id,
+                        attribute_name="synced_to",
+                        timeout=RECONNECT_JOIN_TIMEOUT,
+                        raise_on_timeout=True,
                     ):
                         await self.mass.players._handle_set_members(
                             leader, player_ids_to_add=[member_id]

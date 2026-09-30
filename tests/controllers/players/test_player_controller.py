@@ -7350,5 +7350,35 @@ class TestAddCurrentlyPlayingToFavorites:
         assert acting_users == [playback_user]
 
 
+class TestWaitForPlayerUpdate:
+    """Test waiting for a player state update around a command."""
+
+    @pytest.mark.asyncio
+    async def test_a_missing_update_is_raised_only_on_request(
+        self, controller: PlayerController
+    ) -> None:
+        """A wait that times out passes quietly by default and raises when asked to."""
+        async with controller.wait_for_player_update(
+            "player1", attribute_name="synced_to", timeout=0.01
+        ):
+            pass
+        with pytest.raises(TimeoutError, match="player1 did not report a synced_to update"):
+            async with controller.wait_for_player_update(
+                "player1", attribute_name="synced_to", timeout=0.01, raise_on_timeout=True
+            ):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_an_update_in_time_satisfies_a_wait_asked_to_raise(
+        self, controller: PlayerController
+    ) -> None:
+        """The update the command triggers ends the wait without an error."""
+        player = MagicMock(player_id="player1")
+        async with controller.wait_for_player_update(
+            "player1", attribute_name="synced_to", timeout=1, raise_on_timeout=True
+        ):
+            controller._dispatch_state_update_subscribers(player, {"synced_to": (None, "leader")})
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

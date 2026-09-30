@@ -1813,6 +1813,14 @@ class TestStaticMemberReconnect:
         bridge.set_protocol_parent_id("leader")
         display_bridge.set_protocol_parent_id("display")
         bridge.set_members = AsyncMock()  # type: ignore[method-assign]
+
+        # the mocked bridge never reports the join back; this test is about the
+        # compatibility refresh, so the wait for the member's report is stubbed out
+        @asynccontextmanager
+        async def _no_wait(*_args: Any, **_kwargs: Any) -> AsyncIterator[None]:
+            yield
+
+        controller.wait_for_player_update = _no_wait  # type: ignore[method-assign]
         players = (leader, bridge, display, display_bridge)
         controller._players = {player.player_id: player for player in players}
         for player in players:
@@ -1911,6 +1919,34 @@ class TestStaticMemberReconnect:
             await task
 
         assert mass.players._handle_set_members.await_count == 3
+        assert not sgp._reconnect_pending_ids
+
+    @pytest.mark.asyncio
+    async def test_static_member_reconnect_retries_a_join_the_member_never_confirms(
+        self, static_reconnect_setup: Any
+    ) -> None:
+        """A join the member does not report back within the timeout is retried, not done."""
+        mass, sgp, _leader, display = static_reconnect_setup()
+        waits: list[dict[str, Any]] = []
+
+        @asynccontextmanager
+        async def _wait_times_out(player_id: str, **kwargs: Any) -> AsyncIterator[None]:
+            waits.append({"player_id": player_id, **kwargs})
+            yield
+            if kwargs.get("raise_on_timeout"):
+                raise TimeoutError(f"Player {player_id} did not report a synced_to update")
+
+        mass.players.wait_for_player_update = _wait_times_out
+        with patch("music_assistant.providers.sync_group.player.RECONNECT_RETRY_DELAY", 0):
+            sgp.on_group_member_updated(display, {"available": (False, True)})
+            task = sgp._reconnect_task
+            assert task is not None
+            await task
+
+        # the join was issued, but only a confirmed one counts: the budget is spent retrying
+        assert mass.players._handle_set_members.await_count == 3
+        assert all(wait["player_id"] == "display" for wait in waits)
+        assert all(wait["attribute_name"] == "synced_to" for wait in waits)
         assert not sgp._reconnect_pending_ids
 
     @pytest.mark.asyncio

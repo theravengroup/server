@@ -2350,6 +2350,7 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
         attribute_name: str | None = None,
         attribute_value: Any = _SENTINEL,
         timeout: float = 5.0,
+        raise_on_timeout: bool = False,
     ) -> AsyncIterator[None]:
         """
         Async context manager that waits for a player state update.
@@ -2358,7 +2359,8 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
         the action that triggers the expected update), then waits for a
         matching update on exit. If ``attribute_name`` and ``attribute_value``
         are both provided and the current value already matches at entry, the
-        wait is skipped.
+        wait is skipped. An update that does not arrive in time is only logged,
+        unless the caller asks for it to be raised.
 
         Example::
 
@@ -2375,6 +2377,8 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
         :param attribute_value: Optional value the watched attribute must reach.
             Only meaningful in combination with ``attribute_name``.
         :param timeout: Maximum time to wait in seconds.
+        :param raise_on_timeout: Raise ``TimeoutError`` when no matching update arrives
+            in time, for callers that must not treat a missing update as success.
         """
         update_event = asyncio.Event()
 
@@ -2410,6 +2414,9 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
                 async with asyncio.timeout(timeout):
                     await update_event.wait()
             except TimeoutError:
+                if raise_on_timeout:
+                    msg = f"Player {player_id} did not report a {attribute_name} update"
+                    raise TimeoutError(msg) from None
                 self.logger.debug(
                     "Timed out waiting for player update on %s (attr=%s value=%s)",
                     player_id,

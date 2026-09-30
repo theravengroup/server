@@ -41,7 +41,8 @@ REFORM_DEBOUNCE_SECONDS: Final[float] = 2.0
 RECONNECT_RETRY_DELAY: Final[float] = 1.0
 RECONNECT_MAX_ATTEMPTS: Final[int] = 3
 # how long a reconnect keeps hold of the member after the join command, waiting for the
-# member to report its new leader, so another group configured with it sees the owner
+# member to report its new leader, so another group configured with it sees the owner;
+# a join not reported in time counts as a failed attempt
 RECONNECT_JOIN_TIMEOUT: Final[float] = 5.0
 
 # Other exceptions must propagate rather than trigger reconnect retries.

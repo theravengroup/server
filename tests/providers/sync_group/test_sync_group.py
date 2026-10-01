@@ -1987,6 +1987,29 @@ class TestStaticMemberReconnect:
         assert sgp._attr_group_members == ["leader", "display"]
 
     @pytest.mark.asyncio
+    async def test_static_member_reconnect_does_not_track_a_member_removed_meanwhile(
+        self, static_reconnect_setup: Any
+    ) -> None:
+        """A member the configuration drops while its join is in flight is not tracked again."""
+        mass, sgp, _leader, display = static_reconnect_setup()
+        sgp._attr_group_members = ["leader"]
+
+        async def _add(_leader_player: Any, player_ids_to_add: list[str]) -> None:
+            assert player_ids_to_add == ["display"]
+            # the user saves the group without the member while the join is under way
+            sgp._attr_static_group_members = ["leader"]
+
+        mass.players._handle_set_members = AsyncMock(side_effect=_add)
+
+        sgp.on_group_member_updated(display, {"available": (False, True)})
+        task = sgp._reconnect_task
+        assert task is not None
+        await task
+
+        mass.players._handle_set_members.assert_awaited_once()
+        assert sgp._attr_group_members == ["leader"]
+
+    @pytest.mark.asyncio
     async def test_leader_update_schedules_only_the_members_it_does_not_hold(
         self, static_reconnect_three_member_setup: Any
     ) -> None:

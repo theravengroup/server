@@ -1760,6 +1760,8 @@ class SyncGroupPlayer(Player):
             # get_player_lock requires) and keep hold of it until the member reports
             # its new leader, so the other group finds the owner rather than a race.
             async with self.mass.players.get_player_lock(member_id, PlayerLockPurpose.PLAYBACK):
+                # the member may have been rediscovered while the lock was waited for
+                member = self.mass.players.get_player(member_id)
                 if not self._reconnect_member_eligible(member_id, leader, member):
                     if member_id in self._translate_to_parent_ids(leader.state.group_members):
                         # the join landed after all (confirmed late, or made by the device)
@@ -1870,8 +1872,12 @@ class SyncGroupPlayer(Player):
         """Put a member that is back with the leader on the group's tracked member list."""
         # a reconnect joins the member through the leader directly, past set_members, so
         # the list a form dropped it from while it was incompatible is not restored on
-        # the way; left out, the next formation would leave it out again
-        if member_id not in self._attr_group_members:
+        # the way; left out, the next formation would leave it out again. A member the
+        # configuration dropped while the join was in flight is not put back
+        if (
+            member_id in self._attr_static_group_members
+            and member_id not in self._attr_group_members
+        ):
             self._attr_group_members.append(member_id)
 
     async def _reform_runner(self) -> None:

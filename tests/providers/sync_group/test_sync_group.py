@@ -1927,6 +1927,9 @@ class TestStaticMemberReconnect:
     ) -> None:
         """A join the member does not report back within the timeout is retried, not done."""
         mass, sgp, _leader, display = static_reconnect_setup()
+        # dropped from the tracked list earlier (incompatible at the time): only a
+        # confirmed join may put it back
+        sgp._attr_group_members = ["leader"]
         waits: list[dict[str, Any]] = []
 
         @asynccontextmanager
@@ -1948,6 +1951,28 @@ class TestStaticMemberReconnect:
         assert all(wait["player_id"] == "display" for wait in waits)
         assert all(wait["attribute_name"] == "synced_to" for wait in waits)
         assert not sgp._reconnect_pending_ids
+        assert sgp._attr_group_members == ["leader"]
+
+    @pytest.mark.asyncio
+    async def test_static_member_reconnect_restores_a_member_a_form_dropped(
+        self, static_reconnect_setup: Any
+    ) -> None:
+        """A confirmed join puts the member back on the tracked list for the next formation."""
+        mass, sgp, leader, display = static_reconnect_setup()
+        # a form dropped it as incompatible with the leader at the time; its reconnect
+        # goes to the leader directly, past set_members, so it must restore the list itself
+        sgp._attr_group_members = ["leader"]
+        mass.players._handle_set_members = AsyncMock()
+
+        sgp.on_group_member_updated(display, {"available": (False, True)})
+        task = sgp._reconnect_task
+        assert task is not None
+        await task
+
+        mass.players._handle_set_members.assert_awaited_once_with(
+            leader, player_ids_to_add=["display"]
+        )
+        assert sgp._attr_group_members == ["leader", "display"]
 
     @pytest.mark.asyncio
     async def test_static_member_reconnect_cancellation_propagates(

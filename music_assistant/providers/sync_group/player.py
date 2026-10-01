@@ -1764,6 +1764,11 @@ class SyncGroupPlayer(Player):
                         await self.mass.players._handle_set_members(
                             leader, player_ids_to_add=[member_id]
                         )
+                    # the join went to the leader directly, past set_members: put the member
+                    # back on the tracked list a form may have dropped it from while it was
+                    # incompatible, or the next formation would leave it out again
+                    if member_id not in self._attr_group_members:
+                        self._attr_group_members.append(member_id)
                 except asyncio.CancelledError:
                     raise
                 except RECONNECT_RETRYABLE_ERRORS as err:

@@ -770,8 +770,13 @@ class SyncGroupPlayer(Player):
             leader = current_leader
         if member_player.player_id == leader.player_id:
             if self._reconnect_relevant_change(changed_values):
+                # the leader's compatibility list changes with every speaker in the house
+                # coming or going, so only the members it does not hold are worth a pass
+                grouped = self._translate_to_parent_ids(leader.state.group_members)
                 for member_id in self._attr_static_group_members:
-                    if member_id != member_player.player_id:
+                    if member_id != member_player.player_id and (
+                        member_id not in grouped or member_id in self._reconnect_pending_ids
+                    ):
                         self._schedule_reconnect(member_id)
             return
         if member_player.player_id not in self._attr_static_group_members:
@@ -1697,7 +1702,13 @@ class SyncGroupPlayer(Player):
                 self._reconnect_task = None
 
     def _record_reconnect_attempt(self, member_id: str, attempts: dict[str, int]) -> int:
-        """Record a failed reconnect attempt and retain it while retries remain."""
+        """
+        Record a failed reconnect attempt and keep the member pending while retries remain.
+
+        :param member_id: The static member the attempt was for.
+        :param attempts: The attempts made per member in this reconnect episode.
+        :return: The number of attempts made for the member so far.
+        """
         attempt = attempts[member_id] = attempts.get(member_id, 0) + 1
         if attempt < RECONNECT_MAX_ATTEMPTS:
             self._reconnect_pending_ids.add(member_id)
@@ -1714,7 +1725,14 @@ class SyncGroupPlayer(Player):
     async def _reconnect_member_locked(
         self, member_id: str, leader_id: str, attempts: dict[str, int]
     ) -> bool:
-        """Add one eligible reconnecting member while holding the group lock."""
+        """
+        Add one eligible reconnecting member while holding the group lock.
+
+        :param member_id: The static member to reconnect.
+        :param leader_id: The sync leader the member is to join.
+        :param attempts: The attempts made per member in this reconnect episode.
+        :return: Whether the episode may go on with the members still pending.
+        """
         async with self.mass.players.get_player_lock(leader_id, PlayerLockPurpose.PLAYBACK):
             if self.sync_leader is None or self.sync_leader.player_id != leader_id:
                 self._reconnect_pending_ids.clear()
@@ -1730,12 +1748,22 @@ class SyncGroupPlayer(Player):
             if leader is None or not leader.state.available or not leader.state.enabled:
                 self._record_reconnect_attempt(member_id, attempts)
                 return True
+            if member is not None and self._reconnect_member_has_owner(
+                member, member_id, leader_id
+            ):
+                # checked before the member's lock is taken: the owner may be a group
+                # whose leader is this member, waiting on our leader's lock in turn
+                self._reconnect_pending_ids.discard(member_id)
+                return True
             # Another active group configured with this member may be reconnecting it
             # too. Serialize on the member (taken from under the group lock, the order
             # get_player_lock requires) and keep hold of it until the member reports
             # its new leader, so the other group finds the owner rather than a race.
             async with self.mass.players.get_player_lock(member_id, PlayerLockPurpose.PLAYBACK):
                 if not self._reconnect_member_eligible(member_id, leader, member):
+                    if member_id in self._translate_to_parent_ids(leader.state.group_members):
+                        # the join landed after all (confirmed late, or made by the device)
+                        self._track_reconnected_member(member_id)
                     self._reconnect_pending_ids.discard(member_id)
                     return True
                 self._reconnect_pending_ids.discard(member_id)
@@ -1746,31 +1774,30 @@ class SyncGroupPlayer(Player):
                         ):
                             protocol_player.refresh_state(signal_event=False)
                     leader.refresh_state(signal_event=False)
+                    if member_id in self._translate_to_parent_ids(leader.state.group_members):
+                        self._track_reconnected_member(member_id)
+                        return True
                     # A returning player can become available before its protocol reports
                     # compatibility. Keep the reconnect pending so the next bounded pass
                     # can use the refreshed capability instead of silently dropping it.
                     if member_id not in leader.state.can_group_with:
                         self._record_reconnect_attempt(member_id, attempts)
                         return True
-                    # a join the member never confirms is a failed attempt, not a done one:
-                    # left as done, the member would be abandoned and its lock released
-                    # without another group being able to see an owner
+                    # only the member reporting this leader confirms the join: a join it
+                    # never reports, or a report of another owner, is a failed attempt. Left
+                    # as done, the member would be abandoned and its lock released without
+                    # another group being able to see an owner
                     async with self.mass.players.wait_for_player_update(
                         member_id,
                         attribute_name="synced_to",
+                        attribute_value=leader.player_id,
                         timeout=RECONNECT_JOIN_TIMEOUT,
                         raise_on_timeout=True,
                     ):
                         await self.mass.players._handle_set_members(
                             leader, player_ids_to_add=[member_id]
                         )
-                    # the join went to the leader directly, past set_members: put the member
-                    # back on the tracked list a form may have dropped it from while it was
-                    # incompatible, or the next formation would leave it out again
-                    if member_id not in self._attr_group_members:
-                        self._attr_group_members.append(member_id)
-                except asyncio.CancelledError:
-                    raise
+                    self._track_reconnected_member(member_id)
                 except RECONNECT_RETRYABLE_ERRORS as err:
                     attempt = self._record_reconnect_attempt(member_id, attempts)
                     self.logger.warning(
@@ -1786,7 +1813,13 @@ class SyncGroupPlayer(Player):
     def _reconnect_member_eligible(
         self, member_id: str, leader: Player, member: Player | None
     ) -> bool:
-        """Return whether a live static member may join the current leader."""
+        """
+        Return whether a live static member may join the current leader.
+
+        :param member_id: The static member to check.
+        :param leader: The sync leader the member would join.
+        :param member: The member's player, if it is registered.
+        """
         if member is None or member_id not in self._attr_static_group_members:
             return False
         if not member.state.available or not member.state.enabled:
@@ -1801,7 +1834,13 @@ class SyncGroupPlayer(Player):
         return not self._reconnect_member_has_owner(member, member_id, leader.player_id)
 
     def _reconnect_member_has_owner(self, member: Player, member_id: str, leader_id: str) -> bool:
-        """Return whether another active group owns a reconnecting member."""
+        """
+        Return whether another active group owns a reconnecting member.
+
+        :param member: The member's player.
+        :param member_id: The static member to check.
+        :param leader_id: This group's sync leader, which does not count as another owner.
+        """
         owner_ids = {
             owner_id
             for owner_id in (member.state.active_group, member.state.synced_to)
@@ -1826,6 +1865,14 @@ class SyncGroupPlayer(Player):
             self.logger.debug("Skipping reconnect of %s: another group owns it", member_id)
             return True
         return False
+
+    def _track_reconnected_member(self, member_id: str) -> None:
+        """Put a member that is back with the leader on the group's tracked member list."""
+        # a reconnect joins the member through the leader directly, past set_members, so
+        # the list a form dropped it from while it was incompatible is not restored on
+        # the way; left out, the next formation would leave it out again
+        if member_id not in self._attr_group_members:
+            self._attr_group_members.append(member_id)
 
     async def _reform_runner(self) -> None:
         """Wait the debounce window, then re-form the group and resume playback."""

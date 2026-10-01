@@ -1949,9 +1949,61 @@ class TestStaticMemberReconnect:
         # the join was issued, but only a confirmed one counts: the budget is spent retrying
         assert mass.players._handle_set_members.await_count == 3
         assert all(wait["player_id"] == "display" for wait in waits)
+        # the member reporting this leader is the confirmation, not any change of owner
         assert all(wait["attribute_name"] == "synced_to" for wait in waits)
+        assert all(wait["attribute_value"] == "leader" for wait in waits)
         assert not sgp._reconnect_pending_ids
         assert sgp._attr_group_members == ["leader"]
+
+    @pytest.mark.asyncio
+    async def test_static_member_reconnect_tracks_a_join_confirmed_late(
+        self, static_reconnect_setup: Any
+    ) -> None:
+        """A join the member confirms only after the wait is found on the retry and tracked."""
+        mass, sgp, _leader, display = static_reconnect_setup()
+        sgp._attr_group_members = ["leader"]
+
+        async def _add(leader_player: Any, player_ids_to_add: list[str]) -> None:
+            # the leader lists the member right away; the member's own report comes late
+            leader_player.state.group_members = ["leader", *player_ids_to_add]
+
+        mass.players._handle_set_members = AsyncMock(side_effect=_add)
+
+        @asynccontextmanager
+        async def _wait_times_out(player_id: str, **_kwargs: Any) -> AsyncIterator[None]:
+            yield
+            raise TimeoutError(f"Player {player_id} did not report a synced_to update")
+
+        mass.players.wait_for_player_update = _wait_times_out
+        with patch("music_assistant.providers.sync_group.player.RECONNECT_RETRY_DELAY", 0):
+            sgp.on_group_member_updated(display, {"available": (False, True)})
+            task = sgp._reconnect_task
+            assert task is not None
+            await task
+
+        # the retry finds the member with the leader and tracks it instead of joining again
+        mass.players._handle_set_members.assert_awaited_once()
+        assert not sgp._reconnect_pending_ids
+        assert sgp._attr_group_members == ["leader", "display"]
+
+    @pytest.mark.asyncio
+    async def test_leader_update_schedules_only_the_members_it_does_not_hold(
+        self, static_reconnect_three_member_setup: Any
+    ) -> None:
+        """A leader-side trigger passes over the static members the leader already holds."""
+        mass, sgp, leader, _display, _lamp = static_reconnect_three_member_setup()
+        leader.state.group_members = ["leader", "display"]
+        mass.players._handle_set_members = AsyncMock()
+
+        sgp.on_group_member_updated(leader, {"can_group_with": (frozenset(), frozenset({"x"}))})
+        assert sgp._reconnect_pending_ids == {"lamp"}
+        task = sgp._reconnect_task
+        assert task is not None
+        await task
+
+        mass.players._handle_set_members.assert_awaited_once_with(
+            leader, player_ids_to_add=["lamp"]
+        )
 
     @pytest.mark.asyncio
     async def test_static_member_reconnect_restores_a_member_a_form_dropped(
@@ -2501,25 +2553,86 @@ class TestStaticMemberReconnect:
 
         mass.players.get_player_lock = _player_lock
         joined: list[str] = []
+        reports: list[asyncio.Task[None]] = []
+
+        async def _report_join(leader: Any) -> None:
+            await asyncio.sleep(0)
+            display.state.synced_to = leader.player_id
 
         async def _add(leader: Any, player_ids_to_add: list[str]) -> None:
             assert player_ids_to_add == ["display"]
             joined.append(leader.player_id)
-            # the provider round-trip: the other group's runner gets to run in here
-            await asyncio.sleep(0)
-            display.state.synced_to = leader.player_id
+            # the member reports its new leader only after the command has returned: the
+            # other group's runner gets to run in that gap
+            reports.append(asyncio.create_task(_report_join(leader)))
+
+        @asynccontextmanager
+        async def _wait_for_report(player_id: str, **kwargs: Any) -> AsyncIterator[None]:
+            yield
+            for _ in range(10):
+                if display.state.synced_to == kwargs["attribute_value"]:
+                    return
+                await asyncio.sleep(0)
+            raise TimeoutError(f"Player {player_id} did not report a synced_to update")
 
         mass.players._handle_set_members = AsyncMock(side_effect=_add)
+        mass.players.wait_for_player_update = _wait_for_report
 
         group_a.on_group_member_updated(display, {"available": (False, True)})
         group_b.on_group_member_updated(display, {"available": (False, True)})
         assert group_a._reconnect_task is not None
         assert group_b._reconnect_task is not None
-        await asyncio.gather(group_a._reconnect_task, group_b._reconnect_task)
+        await asyncio.gather(group_a._reconnect_task, group_b._reconnect_task, *reports)
 
         # whichever group got there first owns the member; the other one saw that and left it
         assert len(joined) == 1
         assert display.state.synced_to == joined[0]
+        assert not group_a._reconnect_pending_ids
+        assert not group_b._reconnect_pending_ids
+
+    @pytest.mark.asyncio
+    async def test_groups_leading_each_others_members_do_not_deadlock(
+        self, static_reconnect_setup: Any
+    ) -> None:
+        """Two active groups whose leaders are each other's static members both back off."""
+        mass, group_a, leader_a, display = static_reconnect_setup()
+        # group B is led by group A's member and configured with group A's leader; both
+        # leaders lead on their own, so each is owned by its group
+        group_b = _make_sync_group(mass, "syncgroup_b")
+        group_b.config.get_value = MagicMock(  # type: ignore[method-assign]
+            side_effect=lambda key, default=None: False if key == "dynamic_members" else default
+        )
+        display.state.group_members = ["display"]
+        display.state.can_group_with = {"leader"}
+        display.state.active_group = group_b.player_id
+        leader_a.state.active_group = group_a.player_id
+        group_b._attr_static_group_members = ["display", "leader"]
+        group_b._attr_group_members = ["display", "leader"]
+        group_b.sync_leader = display
+        locks: dict[str, asyncio.Lock] = {}
+
+        @asynccontextmanager
+        async def _player_lock(player_id: str, purpose: Any = None) -> AsyncIterator[None]:
+            # a lock request may always find the lock taken for a moment and have to
+            # wait: let the other runner in before each one, as such a wait would
+            await asyncio.sleep(0)
+            async with locks.setdefault(f"{purpose}_{player_id}", asyncio.Lock()):
+                yield
+
+        mass.players.get_player_lock = _player_lock
+        mass.players._handle_set_members = AsyncMock()
+
+        # the display comes back: group A wants it as a member, group B (which it leads)
+        # wants group A's leader; each runner holds its own leader while asking for the other
+        group_a.on_group_member_updated(display, {"available": (False, True)})
+        group_b.on_group_member_updated(display, {"available": (False, True)})
+        assert group_a._reconnect_task is not None
+        assert group_b._reconnect_task is not None
+        await asyncio.wait_for(
+            asyncio.gather(group_a._reconnect_task, group_b._reconnect_task), timeout=1
+        )
+
+        mass.players._handle_set_members.assert_not_awaited()
         assert not group_a._reconnect_pending_ids
         assert not group_b._reconnect_pending_ids
 
